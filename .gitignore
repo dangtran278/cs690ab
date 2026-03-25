@@ -209,5 +209,6 @@ __marimo__/
 # Project
 .conda/
 datasets/
+logs/
 KIVI/
 KVQuant/
