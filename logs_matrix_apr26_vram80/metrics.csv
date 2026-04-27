@@ -1,0 +1,64 @@
+run_id,metric_name,metric_value,unit,split,notes
+20260427T052304Z_21a4c46a,wikitext2_ppl_4k,6.1288580894470215,ppl,test,"max_tokens=4096,prefill_tokens=512,kivi_mode=official_like,k_residual_length=2048,v_residual_length=2048,kivi_diagnostics=0,kivi_parity_checks=0,kivi_drift_probe_interval=0,kivi_telemetry=0"
+20260427T052433Z_765fedd6,passkey_accuracy,1.0,ratio,eval,"context_len=2048,target=25248,pred=25248,tail=25248. Remember it. 25248 is"
+20260427T052434Z_de48726f,passkey_accuracy,1.0,ratio,eval,"context_len=4096,target=25248,pred=25248,tail=25248. Remember it. 25248 is"
+20260427T052435Z_12664a7c,passkey_accuracy,1.0,ratio,eval,"context_len=8192,target=25248,pred=25248,tail=25248. Remember it. 25248 is"
+20260427T052436Z_c8a1febe,passkey_accuracy,1.0,ratio,eval,"context_len=16384,target=25248,pred=25248,tail=25248. Remember it. 25248 is"
+20260427T052441Z_33d2d9af,kv_cache_peak_vram_gb,20.197852611541748,GB,eval,"context_len=2048,decode_tokens=10,kind=allocated"
+20260427T052441Z_ae622e87,kv_cache_peak_vram_gb,25.179484844207764,GB,eval,"context_len=4096,decode_tokens=10,kind=allocated"
+20260427T052442Z_76fab85a,kv_cache_peak_vram_gb,35.1352972984314,GB,eval,"context_len=8192,decode_tokens=10,kind=allocated"
+20260427T052443Z_4a90404b,kv_cache_peak_vram_gb,55.0525426864624,GB,eval,"context_len=16384,decode_tokens=10,kind=allocated"
+20260427T052446Z_b991beaa,decode_latency_ms_per_token,23.27219129688274,ms/token,eval,"context_len=4096,decode_tokens=64,warmup=8"
+20260427T052450Z_772dc5d0,throughput_tokens_per_sec,7457.139290314539,tokens/sec,eval,"context_len=4096,batch_size=1"
+20260427T052450Z_8fe22602,throughput_tokens_per_sec,7555.161989520458,tokens/sec,eval,"context_len=4096,batch_size=2"
+20260427T052450Z_7d203c33,throughput_tokens_per_sec,7645.614929449648,tokens/sec,eval,"context_len=4096,batch_size=4"
+20260427T052452Z_2337f9b9,throughput_tokens_per_sec,7731.722085999273,tokens/sec,eval,"context_len=4096,batch_size=8"
+20260427T052454Z_2768130a,throughput_tokens_per_sec,7675.112595129212,tokens/sec,eval,"context_len=4096,batch_size=16"
+20260427T052458Z_7bda4728,max_batch_size_under_vram,16,batch,eval,"context_len=4096,first_oom_batch=-1"
+20260427T052458Z_b21a05c2,memory_scaling_vram_gb,15.968519687652588,GB,eval,context_len=2048
+20260427T052458Z_36ca3c63,memory_scaling_vram_gb,16.930445671081543,GB,eval,context_len=4096
+20260427T052458Z_ed963260,memory_scaling_vram_gb,19.417691707611084,GB,eval,context_len=8192
+20260427T052459Z_b3009157,memory_scaling_vram_gb,31.307376861572266,GB,eval,context_len=16384
+20260427T052503Z_12a9d36d,long_context_boundary,16384,tokens,eval,"last_success_context=16384,first_oom_context=32768"
+20260427T052510Z_4a1e4949,wikitext2_ppl_4k,15.836835861206055,ppl,test,"max_tokens=4096,prefill_tokens=512,kivi_mode=official_like,k_residual_length=2048,v_residual_length=2048,kivi_diagnostics=0,kivi_parity_checks=0,kivi_drift_probe_interval=0,kivi_telemetry=0"
+20260427T052646Z_8b5b7957,passkey_accuracy,1.0,ratio,eval,"context_len=2048,target=25248,pred=25248,tail=25248. Remember it. 25248 is"
+20260427T052646Z_ee98040d,passkey_accuracy,1.0,ratio,eval,"context_len=4096,target=25248,pred=25248,tail=25248. Remember it. 25248 is"
+20260427T052647Z_ef118856,passkey_accuracy,1.0,ratio,eval,"context_len=8192,target=25248,pred=25248,tail=25248. Remember it. The grass is green"
+20260427T052648Z_6fd262f3,passkey_accuracy,1.0,ratio,eval,"context_len=16384,target=25248,pred=25248,tail=25248. The grass is blue. The sun"
+20260427T052653Z_200255f1,kv_cache_peak_vram_gb,20.077843189239502,GB,eval,"context_len=2048,decode_tokens=10,kind=allocated"
+20260427T052654Z_23b63fb3,kv_cache_peak_vram_gb,24.944822311401367,GB,eval,"context_len=4096,decode_tokens=10,kind=allocated"
+20260427T052654Z_39d9c580,kv_cache_peak_vram_gb,34.819701194763184,GB,eval,"context_len=8192,decode_tokens=10,kind=allocated"
+20260427T052656Z_0647fae9,kv_cache_peak_vram_gb,54.5360951423645,GB,eval,"context_len=16384,decode_tokens=10,kind=allocated"
+20260427T052659Z_6e4c812e,decode_latency_ms_per_token,24.92603598432197,ms/token,eval,"context_len=4096,decode_tokens=64,warmup=8"
+20260427T052702Z_aa45dc8c,throughput_tokens_per_sec,7449.843315400547,tokens/sec,eval,"context_len=4096,batch_size=1"
+20260427T052702Z_f804b316,throughput_tokens_per_sec,7551.814718781744,tokens/sec,eval,"context_len=4096,batch_size=2"
+20260427T052702Z_2c473d0d,throughput_tokens_per_sec,7640.486314264453,tokens/sec,eval,"context_len=4096,batch_size=4"
+20260427T052704Z_72512532,throughput_tokens_per_sec,7717.474532581202,tokens/sec,eval,"context_len=4096,batch_size=8"
+20260427T052706Z_f721df43,throughput_tokens_per_sec,7677.218948935657,tokens/sec,eval,"context_len=4096,batch_size=16"
+20260427T052710Z_7c89f7f7,max_batch_size_under_vram,16,batch,eval,"context_len=4096,first_oom_batch=-1"
+20260427T052710Z_64b9358f,memory_scaling_vram_gb,15.849708080291748,GB,eval,context_len=2048
+20260427T052710Z_d2aeac7f,memory_scaling_vram_gb,16.696846961975098,GB,eval,context_len=4096
+20260427T052710Z_b55bc18b,memory_scaling_vram_gb,19.552777767181396,GB,eval,context_len=8192
+20260427T052711Z_f6dbe01f,memory_scaling_vram_gb,31.696788787841797,GB,eval,context_len=16384
+20260427T052714Z_67e33e1d,long_context_boundary,16384,tokens,eval,"last_success_context=16384,first_oom_context=32768"
+20260427T052722Z_e627382e,wikitext2_ppl_4k,15.546464920043945,ppl,test,"max_tokens=4096,prefill_tokens=512,kivi_mode=official_like,k_residual_length=2048,v_residual_length=2048,kivi_diagnostics=0,kivi_parity_checks=0,kivi_drift_probe_interval=0,kivi_telemetry=0"
+20260427T052856Z_177a26b2,passkey_accuracy,1.0,ratio,eval,"context_len=2048,target=25248,pred=25248,tail=25248. Remember it. 25248 is"
+20260427T052856Z_4d0a3ba9,passkey_accuracy,1.0,ratio,eval,"context_len=4096,target=25248,pred=25248,tail=25248. Remember it. 25248 is"
+20260427T052857Z_dbb70b90,passkey_accuracy,1.0,ratio,eval,"context_len=8192,target=25248,pred=25248,tail=25248. Remember it. The grass is green"
+20260427T052858Z_cce38d6c,passkey_accuracy,0.0,ratio,eval,"context_len=16384,target=25248,pred=2528,tail=2528.The grass is green."
+20260427T052903Z_53221d4b,kv_cache_peak_vram_gb,20.077843189239502,GB,eval,"context_len=2048,decode_tokens=10,kind=allocated"
+20260427T052904Z_a3884f38,kv_cache_peak_vram_gb,24.944822311401367,GB,eval,"context_len=4096,decode_tokens=10,kind=allocated"
+20260427T052904Z_81eea607,kv_cache_peak_vram_gb,34.819701194763184,GB,eval,"context_len=8192,decode_tokens=10,kind=allocated"
+20260427T052905Z_e821cada,kv_cache_peak_vram_gb,54.5360951423645,GB,eval,"context_len=16384,decode_tokens=10,kind=allocated"
+20260427T052909Z_65f9d260,decode_latency_ms_per_token,24.895377874941005,ms/token,eval,"context_len=4096,decode_tokens=64,warmup=8"
+20260427T052912Z_0d27c121,throughput_tokens_per_sec,7451.636291031369,tokens/sec,eval,"context_len=4096,batch_size=1"
+20260427T052912Z_b4269d33,throughput_tokens_per_sec,7554.730999474397,tokens/sec,eval,"context_len=4096,batch_size=2"
+20260427T052912Z_914b0613,throughput_tokens_per_sec,7643.855234292509,tokens/sec,eval,"context_len=4096,batch_size=4"
+20260427T052913Z_5df8a99b,throughput_tokens_per_sec,7723.779781485843,tokens/sec,eval,"context_len=4096,batch_size=8"
+20260427T052915Z_dd341833,throughput_tokens_per_sec,7678.2557846866375,tokens/sec,eval,"context_len=4096,batch_size=16"
+20260427T052920Z_bf041626,max_batch_size_under_vram,16,batch,eval,"context_len=4096,first_oom_batch=-1"
+20260427T052920Z_ecb3e7d6,memory_scaling_vram_gb,15.849708080291748,GB,eval,context_len=2048
+20260427T052920Z_4eaff665,memory_scaling_vram_gb,16.696846961975098,GB,eval,context_len=4096
+20260427T052920Z_9a0843a5,memory_scaling_vram_gb,19.552777767181396,GB,eval,context_len=8192
+20260427T052921Z_1e90d46d,memory_scaling_vram_gb,31.696788787841797,GB,eval,context_len=16384
+20260427T052924Z_3c1b2193,long_context_boundary,16384,tokens,eval,"last_success_context=16384,first_oom_context=32768"
