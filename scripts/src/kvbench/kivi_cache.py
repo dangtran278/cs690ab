@@ -28,13 +28,19 @@ def validate_kivi_bits(k_bits: int, v_bits: int) -> None:
 class KiviCacheState:
     # Quantized long-term storage
     k_q: Optional[torch.Tensor] = None  # (b, kvh, t, d) uint8/int
+    k_q_len: int = 0
     k_params: Optional[AffineQuantParams] = None
+    k_param_len: int = 0
     v_q: Optional[torch.Tensor] = None  # (b, kvh, t, d)
+    v_q_len: int = 0
     v_params: Optional[AffineQuantParams] = None
+    v_param_len: int = 0
 
     # Full-precision residual window
-    k_fp: Optional[torch.Tensor] = None  # (b, kvh, t_fp, d)
-    v_fp: Optional[torch.Tensor] = None  # (b, kvh, t_fp, d)
+    k_fp: Optional[torch.Tensor] = None  # (b, kvh, cap, d)
+    v_fp: Optional[torch.Tensor] = None  # (b, kvh, cap, d)
+    fp_start: int = 0
+    fp_len: int = 0
 
     # Total tokens seen (for bookkeeping)
     total_len: int = 0
@@ -112,10 +118,10 @@ class KiviCache:
     def _emit_telemetry(self, state: KiviCacheState, payload: dict[str, Any]) -> None:
         enriched = {
             "total_len": int(state.total_len),
-            "k_q_len": int(state.k_q.shape[-2]) if state.k_q is not None else 0,
-            "v_q_len": int(state.v_q.shape[-2]) if state.v_q is not None else 0,
-            "k_fp_len": int(state.k_fp.shape[-2]) if state.k_fp is not None else 0,
-            "v_fp_len": int(state.v_fp.shape[-2]) if state.v_fp is not None else 0,
+            "k_q_len": int(state.k_q_len),
+            "v_q_len": int(state.v_q_len),
+            "k_fp_len": int(state.fp_len),
+            "v_fp_len": int(state.fp_len),
             **payload,
         }
         state.telemetry.append(enriched)
@@ -134,18 +140,122 @@ class KiviCache:
         token_axis: bool,
     ) -> dict[str, float]:
         if token_axis:
-            deq = affine_dequantize_per_group_token_dim(q, params, self.group_size, out_dtype=x.dtype)
+            deq = affine_dequantize_per_group_token_dim(
+                q, params, self.group_size, out_dtype=x.dtype, diagnostics=self.diagnostics
+            )
         else:
-            deq = affine_dequantize_per_group_last_dim(q, params, self.group_size, out_dtype=x.dtype)
+            deq = affine_dequantize_per_group_last_dim(
+                q, params, self.group_size, out_dtype=x.dtype, diagnostics=self.diagnostics
+            )
         err = (deq.to(torch.float32) - x.to(torch.float32)).abs()
         return {"mean_abs_err": float(err.mean().item()), "max_abs_err": float(err.max().item())}
 
+    def _fp_compact_if_needed(self, state: KiviCacheState) -> None:
+        if state.k_fp is None or state.v_fp is None or state.fp_start == 0:
+            return
+        end = state.fp_start + state.fp_len
+        state.k_fp[..., : state.fp_len, :].copy_(state.k_fp[..., state.fp_start:end, :])
+        state.v_fp[..., : state.fp_len, :].copy_(state.v_fp[..., state.fp_start:end, :])
+        state.fp_start = 0
+
+    def _ensure_fp_capacity(self, state: KiviCacheState, k: torch.Tensor, v: torch.Tensor, needed_len: int) -> None:
+        if state.k_fp is None or state.v_fp is None:
+            cap = max(needed_len, self.residual_length + self.group_size)
+            state.k_fp = torch.empty(*k.shape[:2], cap, k.shape[-1], dtype=k.dtype, device=k.device)
+            state.v_fp = torch.empty(*v.shape[:2], cap, v.shape[-1], dtype=v.dtype, device=v.device)
+            state.fp_start = 0
+            state.fp_len = 0
+            return
+        self._fp_compact_if_needed(state)
+        cur_cap = int(state.k_fp.shape[-2])
+        if needed_len <= cur_cap:
+            return
+        new_cap = cur_cap
+        while new_cap < needed_len:
+            new_cap *= 2
+        k_new = torch.empty(*state.k_fp.shape[:2], new_cap, state.k_fp.shape[-1], dtype=state.k_fp.dtype, device=state.k_fp.device)
+        v_new = torch.empty(*state.v_fp.shape[:2], new_cap, state.v_fp.shape[-1], dtype=state.v_fp.dtype, device=state.v_fp.device)
+        if state.fp_len > 0:
+            k_new[..., : state.fp_len, :].copy_(state.k_fp[..., : state.fp_len, :])
+            v_new[..., : state.fp_len, :].copy_(state.v_fp[..., : state.fp_len, :])
+        state.k_fp = k_new
+        state.v_fp = v_new
+        state.fp_start = 0
+
+    def _fp_view(self, state: KiviCacheState) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if state.k_fp is None or state.v_fp is None or state.fp_len == 0:
+            return None, None
+        s = state.fp_start
+        e = s + state.fp_len
+        return state.k_fp[..., s:e, :], state.v_fp[..., s:e, :]
+
+    def _reserve_quant_storage(self, state: KiviCacheState, k_q_new: torch.Tensor, v_q_new: torch.Tensor, k_p_new: AffineQuantParams, v_p_new: AffineQuantParams) -> None:
+        needed_q = state.k_q_len + int(k_q_new.shape[-2])
+        needed_kp = state.k_param_len + int(k_p_new.scale.shape[-2])
+        needed_vp = state.v_param_len + int(v_p_new.scale.shape[-3])
+        if state.k_q is None:
+            cap_q = max(needed_q, self.residual_length + self.group_size)
+            cap_kp = max(needed_kp, max(1, cap_q // self.group_size))
+            cap_vp = max(needed_vp, cap_q)
+            state.k_q = torch.empty(*k_q_new.shape[:2], cap_q, k_q_new.shape[-1], dtype=k_q_new.dtype, device=k_q_new.device)
+            state.v_q = torch.empty(*v_q_new.shape[:2], cap_q, v_q_new.shape[-1], dtype=v_q_new.dtype, device=v_q_new.device)
+            state.k_params = AffineQuantParams(
+                scale=torch.empty(*k_p_new.scale.shape[:-2], cap_kp, 1, dtype=k_p_new.scale.dtype, device=k_p_new.scale.device),
+                zero_point=torch.empty(*k_p_new.zero_point.shape[:-2], cap_kp, 1, dtype=k_p_new.zero_point.dtype, device=k_p_new.zero_point.device),
+                qmin=k_p_new.qmin,
+                qmax=k_p_new.qmax,
+            )
+            state.v_params = AffineQuantParams(
+                scale=torch.empty(*v_p_new.scale.shape[:-3], cap_vp, *v_p_new.scale.shape[-2:], dtype=v_p_new.scale.dtype, device=v_p_new.scale.device),
+                zero_point=torch.empty(*v_p_new.zero_point.shape[:-3], cap_vp, *v_p_new.zero_point.shape[-2:], dtype=v_p_new.zero_point.dtype, device=v_p_new.zero_point.device),
+                qmin=v_p_new.qmin,
+                qmax=v_p_new.qmax,
+            )
+            return
+        assert state.k_q is not None and state.v_q is not None and state.k_params is not None and state.v_params is not None
+        q_cap = int(state.k_q.shape[-2])
+        if needed_q > q_cap:
+            new_q_cap = q_cap
+            while new_q_cap < needed_q:
+                new_q_cap *= 2
+            k_q_buf = torch.empty(*state.k_q.shape[:2], new_q_cap, state.k_q.shape[-1], dtype=state.k_q.dtype, device=state.k_q.device)
+            v_q_buf = torch.empty(*state.v_q.shape[:2], new_q_cap, state.v_q.shape[-1], dtype=state.v_q.dtype, device=state.v_q.device)
+            if state.k_q_len > 0:
+                k_q_buf[..., : state.k_q_len, :].copy_(state.k_q[..., : state.k_q_len, :])
+                v_q_buf[..., : state.v_q_len, :].copy_(state.v_q[..., : state.v_q_len, :])
+            state.k_q = k_q_buf
+            state.v_q = v_q_buf
+        kp_cap = int(state.k_params.scale.shape[-2])
+        if needed_kp > kp_cap:
+            new_kp_cap = kp_cap
+            while new_kp_cap < needed_kp:
+                new_kp_cap *= 2
+            k_scale = torch.empty(*state.k_params.scale.shape[:-2], new_kp_cap, 1, dtype=state.k_params.scale.dtype, device=state.k_params.scale.device)
+            k_zero = torch.empty(*state.k_params.zero_point.shape[:-2], new_kp_cap, 1, dtype=state.k_params.zero_point.dtype, device=state.k_params.zero_point.device)
+            if state.k_param_len > 0:
+                k_scale[..., : state.k_param_len, :].copy_(state.k_params.scale[..., : state.k_param_len, :])
+                k_zero[..., : state.k_param_len, :].copy_(state.k_params.zero_point[..., : state.k_param_len, :])
+            state.k_params.scale = k_scale
+            state.k_params.zero_point = k_zero
+        vp_cap = int(state.v_params.scale.shape[-3])
+        if needed_vp > vp_cap:
+            new_vp_cap = vp_cap
+            while new_vp_cap < needed_vp:
+                new_vp_cap *= 2
+            v_scale = torch.empty(*state.v_params.scale.shape[:-3], new_vp_cap, *state.v_params.scale.shape[-2:], dtype=state.v_params.scale.dtype, device=state.v_params.scale.device)
+            v_zero = torch.empty(*state.v_params.zero_point.shape[:-3], new_vp_cap, *state.v_params.zero_point.shape[-2:], dtype=state.v_params.zero_point.dtype, device=state.v_params.zero_point.device)
+            if state.v_param_len > 0:
+                v_scale[..., : state.v_param_len, :, :].copy_(state.v_params.scale[..., : state.v_param_len, :, :])
+                v_zero[..., : state.v_param_len, :, :].copy_(state.v_params.zero_point[..., : state.v_param_len, :, :])
+            state.v_params.scale = v_scale
+            state.v_params.zero_point = v_zero
+
     def _append_quantized(self, state: KiviCacheState, k_flush: torch.Tensor, v_flush: torch.Tensor) -> None:
         k_q_new, k_p_new = affine_quantize_per_group_token_dim(
-            k_flush, bits=self.k_bits, group_size=self.group_size
+            k_flush, bits=self.k_bits, group_size=self.group_size, diagnostics=self.diagnostics
         )
         v_q_new, v_p_new = affine_quantize_per_group_last_dim(
-            v_flush, bits=self.v_bits, group_size=self.group_size
+            v_flush, bits=self.v_bits, group_size=self.group_size, diagnostics=self.diagnostics
         )
         if self.diagnostics:
             k_stats = self._quant_error_stats(k_flush, k_q_new, k_p_new, token_axis=True)
@@ -153,21 +263,41 @@ class KiviCache:
         else:
             k_stats = {}
             v_stats = {}
-        if state.k_q is None:
-            state.k_q, state.k_params = k_q_new, k_p_new
-            state.v_q, state.v_params = v_q_new, v_p_new
-        else:
-            state.k_q = torch.cat([state.k_q, k_q_new], dim=-2)
-            state.v_q = torch.cat([state.v_q, v_q_new], dim=-2)
-            assert state.k_params is not None and state.v_params is not None
-            state.k_params.scale = torch.cat([state.k_params.scale, k_p_new.scale], dim=-2)
-            state.k_params.zero_point = torch.cat([state.k_params.zero_point, k_p_new.zero_point], dim=-2)
-            state.v_params.scale = torch.cat([state.v_params.scale, v_p_new.scale], dim=-3)
-            state.v_params.zero_point = torch.cat([state.v_params.zero_point, v_p_new.zero_point], dim=-3)
+        self._reserve_quant_storage(state, k_q_new, v_q_new, k_p_new, v_p_new)
+        assert state.k_q is not None and state.v_q is not None and state.k_params is not None and state.v_params is not None
+        q_s = state.k_q_len
+        q_e = q_s + int(k_q_new.shape[-2])
+        state.k_q[..., q_s:q_e, :].copy_(k_q_new)
+        state.v_q[..., q_s:q_e, :].copy_(v_q_new)
+        kp_s = state.k_param_len
+        kp_e = kp_s + int(k_p_new.scale.shape[-2])
+        state.k_params.scale[..., kp_s:kp_e, :].copy_(k_p_new.scale)
+        state.k_params.zero_point[..., kp_s:kp_e, :].copy_(k_p_new.zero_point)
+        vp_s = state.v_param_len
+        vp_e = vp_s + int(v_p_new.scale.shape[-3])
+        state.v_params.scale[..., vp_s:vp_e, :, :].copy_(v_p_new.scale)
+        state.v_params.zero_point[..., vp_s:vp_e, :, :].copy_(v_p_new.zero_point)
+        state.k_q_len = q_e
+        state.v_q_len = q_e
+        state.k_param_len = kp_e
+        state.v_param_len = vp_e
         state.quant_append_count += 1
         state.total_flushed_tokens += int(k_flush.shape[-2])
         state.last_flush_len = int(k_flush.shape[-2])
-        self._invalidate_prefix_cache(state)
+        if state.cache_dtype is not None:
+            k_deq_new = affine_dequantize_per_group_token_dim(
+                k_q_new, k_p_new, self.group_size, out_dtype=state.cache_dtype, diagnostics=False
+            )
+            v_deq_new = affine_dequantize_per_group_last_dim(
+                v_q_new, v_p_new, self.group_size, out_dtype=state.cache_dtype, diagnostics=False
+            )
+            if state.cache_k_deq_prefix is None:
+                state.cache_k_deq_prefix = k_deq_new
+                state.cache_v_deq_prefix = v_deq_new
+            else:
+                state.cache_k_deq_prefix = torch.cat([state.cache_k_deq_prefix, k_deq_new], dim=-2)
+                state.cache_v_deq_prefix = torch.cat([state.cache_v_deq_prefix, v_deq_new], dim=-2)
+            state.cache_q_len = state.k_q_len
         self._emit_telemetry(
             state,
             {
@@ -198,30 +328,30 @@ class KiviCache:
         return k_q, k_fp, v_q, v_fp
 
     def _flush_if_full_legacy(self, state: KiviCacheState, *, out_dtype: torch.dtype) -> None:
-        if state.k_fp is None or state.v_fp is None:
+        if state.k_fp is None or state.v_fp is None or state.fp_len == 0:
             return
         # Strict paper queue semantics: when residual reaches R, flush exactly R tokens
         # to quant storage and reset the fp residual (keeping only the remainder < R).
-        while state.k_fp is not None and state.k_fp.shape[-2] >= self.k_residual_length:
-            k_flush = state.k_fp[..., : self.k_residual_length, :]
-            v_flush = state.v_fp[..., : self.k_residual_length, :]
-            state.k_fp = state.k_fp[..., self.k_residual_length :, :]
-            state.v_fp = state.v_fp[..., self.k_residual_length :, :]
-            if state.k_fp.shape[-2] == 0:
-                state.k_fp = None
-                state.v_fp = None
-
+        while state.fp_len >= self.k_residual_length:
+            s = state.fp_start
+            e = s + self.k_residual_length
+            k_flush = state.k_fp[..., s:e, :]
+            v_flush = state.v_fp[..., s:e, :]
+            state.fp_start += self.k_residual_length
+            state.fp_len -= self.k_residual_length
+            if state.fp_len == 0:
+                state.fp_start = 0
             self._append_quantized(state, k_flush, v_flush)
 
     def _flush_if_full_official_like(self, state: KiviCacheState, *, out_dtype: torch.dtype) -> None:
-        if state.k_fp is None or state.v_fp is None:
+        if state.k_fp is None or state.v_fp is None or state.fp_len == 0:
             return
         # Keep sliding fp tails while respecting group constraints.
         # For asymmetric residual settings, enforce both bounds by flushing enough
         # grouped tokens so neither K nor V tail drifts unbounded.
-        while state.k_fp is not None and state.v_fp is not None:
-            k_len = int(state.k_fp.shape[-2])
-            v_len = int(state.v_fp.shape[-2])
+        while state.fp_len > 0:
+            k_len = int(state.fp_len)
+            v_len = int(state.fp_len)
             if k_len != v_len:
                 raise RuntimeError(f"K/V fp tail length mismatch: k_len={k_len} v_len={v_len}")
             if k_len <= self.k_residual_length and v_len <= self.v_residual_length:
@@ -248,31 +378,31 @@ class KiviCache:
                     )
                 break
 
-            k_flush = state.k_fp[..., :flush_len, :]
-            v_flush = state.v_fp[..., :flush_len, :]
-            state.k_fp = state.k_fp[..., flush_len:, :]
-            state.v_fp = state.v_fp[..., flush_len:, :]
-            if state.k_fp.shape[-2] == 0:
-                state.k_fp = None
-            if state.v_fp.shape[-2] == 0:
-                state.v_fp = None
+            s = state.fp_start
+            e = s + flush_len
+            k_flush = state.k_fp[..., s:e, :]
+            v_flush = state.v_fp[..., s:e, :]
+            state.fp_start += flush_len
+            state.fp_len -= flush_len
+            if state.fp_len == 0:
+                state.fp_start = 0
             self._append_quantized(state, k_flush, v_flush)
 
-        if state.k_fp is not None and state.k_fp.shape[-2] > (self.k_residual_length + self.group_size - 1):
+        if state.fp_len > (self.k_residual_length + self.group_size - 1):
             self._record_parity_warning(
                 state,
                 "k_tail_bound",
                 {
-                    "k_fp_len": int(state.k_fp.shape[-2]),
+                    "k_fp_len": int(state.fp_len),
                     "k_tail_bound": int(self.k_residual_length + self.group_size - 1),
                 },
             )
-        if state.v_fp is not None and state.v_fp.shape[-2] > (self.v_residual_length + self.group_size - 1):
+        if state.fp_len > (self.v_residual_length + self.group_size - 1):
             self._record_parity_warning(
                 state,
                 "v_tail_bound",
                 {
-                    "v_fp_len": int(state.v_fp.shape[-2]),
+                    "v_fp_len": int(state.fp_len),
                     "v_tail_bound": int(self.v_residual_length + self.group_size - 1),
                 },
             )
@@ -294,26 +424,23 @@ class KiviCache:
             raise ValueError(f"K/V shape mismatch: k={tuple(k.shape)} v={tuple(v.shape)}")
         if k.shape[-2] <= 0:
             raise ValueError("append expects at least one token on KV token axis")
-        if state.k_fp is None:
-            state.k_fp = k
-            state.v_fp = v
-        else:
-            state.k_fp = torch.cat([state.k_fp, k], dim=-2)
-            state.v_fp = torch.cat([state.v_fp, v], dim=-2)
+        needed = state.fp_len + int(k.shape[-2])
+        self._ensure_fp_capacity(state, k, v, needed)
+        assert state.k_fp is not None and state.v_fp is not None
+        self._fp_compact_if_needed(state)
+        s = state.fp_len
+        e = s + int(k.shape[-2])
+        state.k_fp[..., s:e, :].copy_(k)
+        state.v_fp[..., s:e, :].copy_(v)
+        state.fp_len = e
 
         state.total_len += k.shape[-2]
         self._flush_if_full(state, out_dtype=k.dtype)
-        if state.k_q is not None and state.v_q is not None and int(state.k_q.shape[-2]) != int(state.v_q.shape[-2]):
+        if state.k_q is not None and state.v_q is not None and int(state.k_q_len) != int(state.v_q_len):
             self._record_parity_warning(
                 state,
                 "kv_q_len_mismatch",
-                {"k_q_len": int(state.k_q.shape[-2]), "v_q_len": int(state.v_q.shape[-2])},
-            )
-        if state.k_fp is not None and state.v_fp is not None and int(state.k_fp.shape[-2]) != int(state.v_fp.shape[-2]):
-            self._record_parity_warning(
-                state,
-                "kv_fp_len_mismatch",
-                {"k_fp_len": int(state.k_fp.shape[-2]), "v_fp_len": int(state.v_fp.shape[-2])},
+                {"k_q_len": int(state.k_q_len), "v_q_len": int(state.v_q_len)},
             )
         return state
 
@@ -324,8 +451,16 @@ class KiviCache:
             prefill_quant_len = int(k_q.shape[-2]) if k_q is not None else 0
             if k_q is not None and v_q is not None:
                 self._append_quantized(state, k_q, v_q)
-            state.k_fp = k_fp if state.k_fp is None else torch.cat([state.k_fp, k_fp], dim=-2)
-            state.v_fp = v_fp if state.v_fp is None else torch.cat([state.v_fp, v_fp], dim=-2)
+            if int(k_fp.shape[-2]) > 0:
+                needed = state.fp_len + int(k_fp.shape[-2])
+                self._ensure_fp_capacity(state, k_fp, v_fp, needed)
+                assert state.k_fp is not None and state.v_fp is not None
+                self._fp_compact_if_needed(state)
+                s = state.fp_len
+                e = s + int(k_fp.shape[-2])
+                state.k_fp[..., s:e, :].copy_(k_fp)
+                state.v_fp[..., s:e, :].copy_(v_fp)
+                state.fp_len = e
             state.total_len += int(k.shape[-2])
             self._emit_telemetry(
                 state,
@@ -333,20 +468,14 @@ class KiviCache:
                     "event": "prefill_partition",
                     "prefill_len": int(k.shape[-2]),
                     "prefill_quant_len": prefill_quant_len,
-                    "prefill_fp_len": int(k_fp.shape[-2]),
+                    "prefill_fp_len": int(state.fp_len),
                 },
             )
-            if state.k_q is not None and state.v_q is not None and int(state.k_q.shape[-2]) != int(state.v_q.shape[-2]):
+            if state.k_q is not None and state.v_q is not None and int(state.k_q_len) != int(state.v_q_len):
                 self._record_parity_warning(
                     state,
                     "kv_q_len_mismatch_after_prefill",
-                    {"k_q_len": int(state.k_q.shape[-2]), "v_q_len": int(state.v_q.shape[-2])},
-                )
-            if state.k_fp is not None and state.v_fp is not None and int(state.k_fp.shape[-2]) != int(state.v_fp.shape[-2]):
-                self._record_parity_warning(
-                    state,
-                    "kv_fp_len_mismatch_after_prefill",
-                    {"k_fp_len": int(state.k_fp.shape[-2]), "v_fp_len": int(state.v_fp.shape[-2])},
+                    {"k_q_len": int(state.k_q_len), "v_q_len": int(state.v_q_len)},
                 )
             return state
         return self.append(state, k, v)
@@ -360,9 +489,9 @@ class KiviCache:
         """
         parts_k = []
         parts_v = []
-        if state.k_q is not None:
+        if state.k_q is not None and state.k_q_len > 0:
             assert state.k_params is not None and state.v_q is not None and state.v_params is not None
-            q_len = int(state.k_q.shape[-2])
+            q_len = int(state.k_q_len)
             can_reuse = (
                 state.cache_k_deq_prefix is not None
                 and state.cache_v_deq_prefix is not None
@@ -373,23 +502,37 @@ class KiviCache:
                 k_deq = state.cache_k_deq_prefix
                 v_deq = state.cache_v_deq_prefix
             else:
+                k_q_view = state.k_q[..., : state.k_q_len, :]
+                v_q_view = state.v_q[..., : state.v_q_len, :]
+                k_params = AffineQuantParams(
+                    scale=state.k_params.scale[..., : state.k_param_len, :],
+                    zero_point=state.k_params.zero_point[..., : state.k_param_len, :],
+                    qmin=state.k_params.qmin,
+                    qmax=state.k_params.qmax,
+                )
+                v_params = AffineQuantParams(
+                    scale=state.v_params.scale[..., : state.v_param_len, :, :],
+                    zero_point=state.v_params.zero_point[..., : state.v_param_len, :, :],
+                    qmin=state.v_params.qmin,
+                    qmax=state.v_params.qmax,
+                )
                 # Must mirror _flush_if_full: K token-axis dequant, V last-dim dequant.
                 k_deq = affine_dequantize_per_group_token_dim(
-                    state.k_q, state.k_params, self.group_size, out_dtype=out_dtype
+                    k_q_view, k_params, self.group_size, out_dtype=out_dtype, diagnostics=self.diagnostics
                 )
                 v_deq = affine_dequantize_per_group_last_dim(
-                    state.v_q, state.v_params, self.group_size, out_dtype=out_dtype
+                    v_q_view, v_params, self.group_size, out_dtype=out_dtype, diagnostics=self.diagnostics
                 )
-                if self.kivi_mode == "official_like":
-                    state.cache_k_deq_prefix = k_deq
-                    state.cache_v_deq_prefix = v_deq
-                    state.cache_q_len = q_len
-                    state.cache_dtype = out_dtype
+                state.cache_k_deq_prefix = k_deq
+                state.cache_v_deq_prefix = v_deq
+                state.cache_q_len = q_len
+                state.cache_dtype = out_dtype
             parts_k.append(k_deq)
             parts_v.append(v_deq)
-        if state.k_fp is not None:
-            parts_k.append(state.k_fp.to(out_dtype))
-            parts_v.append(state.v_fp.to(out_dtype))
+        k_fp_view, v_fp_view = self._fp_view(state)
+        if k_fp_view is not None and v_fp_view is not None:
+            parts_k.append(k_fp_view.to(out_dtype))
+            parts_v.append(v_fp_view.to(out_dtype))
         if not parts_k:
             raise RuntimeError("cache is empty")
         return torch.cat(parts_k, dim=-2), torch.cat(parts_v, dim=-2)

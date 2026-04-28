@@ -60,7 +60,7 @@ def perplexity_on_tokens(model, input_ids: torch.Tensor, *, prefill_tokens: Opti
     reset_kvbench_state(model)
     use_internal_cache = _is_kvbench_patched(model)
     device = input_ids.device
-    total_nll = 0.0
+    total_nll = torch.zeros((), dtype=torch.float32, device=device)
     count = 0
 
     total_tokens = int(input_ids.shape[1])
@@ -83,28 +83,31 @@ def perplexity_on_tokens(model, input_ids: torch.Tensor, *, prefill_tokens: Opti
     prefill_targets = input_ids[:, 1 : prefill_len + 1].contiguous().view(-1)
     if prefill_targets.numel() > 0:
         nll = torch.nn.functional.cross_entropy(prefill_logits, prefill_targets, reduction="sum")
-        total_nll += float(nll.item())
+        total_nll = total_nll + nll.to(torch.float32)
         count += int(prefill_targets.numel())
 
+    decode_pos_ids = torch.zeros((1, 1), dtype=torch.long, device=device) if use_internal_cache else None
     # Decode continuation: step t consumes token[t] and predicts token[t+1].
     for t in range(prefill_len, total_tokens - 1):
         token_t = input_ids[:, t : t + 1]
         target = input_ids[:, t + 1]
         if use_internal_cache:
-            pos_ids = torch.tensor([[t]], dtype=torch.long, device=device)
-            out = model(token_t, position_ids=pos_ids, use_cache=False)
+            assert decode_pos_ids is not None
+            decode_pos_ids[0, 0] = t
+            out = model(token_t, position_ids=decode_pos_ids, use_cache=False)
         else:
             out = model(token_t, past_key_values=past_key_values, use_cache=True)
             past_key_values = out.past_key_values
 
         logits = out.logits[:, -1, :]
         nll = torch.nn.functional.cross_entropy(logits, target, reduction="sum")
-        total_nll += float(nll.item())
+        total_nll = total_nll + nll.to(torch.float32)
         count += 1
 
     mean_nll = total_nll / max(count, 1)
-    ppl = float(torch.exp(torch.tensor(mean_nll)).item())
-    if not torch.isfinite(torch.tensor(ppl)):
+    ppl_t = torch.exp(mean_nll)
+    ppl = float(ppl_t.item())
+    if not torch.isfinite(ppl_t):
         raise RuntimeError(f"non-finite perplexity computed: {ppl}")
     return ppl
 

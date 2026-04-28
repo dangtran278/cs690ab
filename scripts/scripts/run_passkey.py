@@ -92,14 +92,16 @@ def greedy_decode_next_tokens(
 
     generated = []
     cur_len = prefill_len
+    decode_pos_ids = torch.zeros((1, 1), dtype=torch.long, device=device) if use_internal_cache else None
     for i in range(max_new_tokens):
         generated.append(next_token)
 
         # Decode one token at a time.
         if use_internal_cache:
             token_pos = cur_len + i
-            pos_ids = torch.tensor([[token_pos]], dtype=torch.long, device=device)
-            out = model(next_token, position_ids=pos_ids, use_cache=False)
+            assert decode_pos_ids is not None
+            decode_pos_ids[0, 0] = token_pos
+            out = model(next_token, position_ids=decode_pos_ids, use_cache=False)
         else:
             out = model(next_token, past_key_values=past_key_values, use_cache=True)
             past_key_values = out.past_key_values

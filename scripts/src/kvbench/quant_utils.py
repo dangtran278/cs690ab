@@ -30,6 +30,7 @@ def affine_quantize_per_group_last_dim(
     group_size: int,
     *,
     eps: float = 1e-8,
+    diagnostics: bool = False,
 ) -> Tuple[torch.Tensor, AffineQuantParams]:
     """Quantize along last dim in contiguous groups.
 
@@ -53,18 +54,20 @@ def affine_quantize_per_group_last_dim(
     xmax = xg.amax(dim=-1, keepdim=True)
     scale = (xmax - xmin).clamp_min(eps) / float(qmax - qmin)
     zero_point = (qmin - xmin / scale).round().clamp(qmin, qmax)
-    if bool((~torch.isfinite(scale)).any() or (~torch.isfinite(zero_point)).any()):
+    if diagnostics and bool((~torch.isfinite(scale)).any() or (~torch.isfinite(zero_point)).any()):
         raise RuntimeError("non-finite quantization params")
 
     # Keep computation order explicit and stable:
     # affine transform -> round-to-nearest -> clamp to code range.
-    q_fp = (xg.to(torch.float32) / scale.to(torch.float32)) + zero_point.to(torch.float32)
+    compute_dtype = torch.float32 if xg.dtype == torch.float32 else xg.dtype
+    q_fp = (xg.to(compute_dtype) / scale.to(compute_dtype)) + zero_point.to(compute_dtype)
     q = q_fp.round().clamp(qmin, qmax)
     q = q.to(_dtype_nbits(bits)).reshape_as(x)
     # Guard against dtype/overflow bugs for high bit-width settings.
-    q_int = q.to(torch.int64)
-    if bool((q_int < qmin).any() or (q_int > qmax).any()):
-        raise RuntimeError(f"quantized code out of range: expected [{qmin}, {qmax}]")
+    if diagnostics:
+        q_int = q.to(torch.int64)
+        if bool((q_int < qmin).any() or (q_int > qmax).any()):
+            raise RuntimeError(f"quantized code out of range: expected [{qmin}, {qmax}]")
     params = AffineQuantParams(scale=scale, zero_point=zero_point, qmin=qmin, qmax=qmax)
     return q, params
 
@@ -75,14 +78,19 @@ def affine_dequantize_per_group_last_dim(
     group_size: int,
     *,
     out_dtype: torch.dtype,
+    diagnostics: bool = False,
 ) -> torch.Tensor:
     d = q.shape[-1]
     ng = d // group_size
-    q_int = q.to(torch.int64)
-    if bool((q_int < params.qmin).any() or (q_int > params.qmax).any()):
-        raise RuntimeError(f"dequantize saw code outside [{params.qmin}, {params.qmax}]")
-    qg = q_int.reshape(*q.shape[:-1], ng, group_size).to(torch.float32)
-    x = (qg - params.zero_point.to(torch.float32)) * params.scale.to(torch.float32)
+    if diagnostics:
+        q_int = q.to(torch.int64)
+        if bool((q_int < params.qmin).any() or (q_int > params.qmax).any()):
+            raise RuntimeError(f"dequantize saw code outside [{params.qmin}, {params.qmax}]")
+        qg = q_int.reshape(*q.shape[:-1], ng, group_size)
+    else:
+        qg = q.reshape(*q.shape[:-1], ng, group_size)
+    compute_dtype = torch.float32 if out_dtype == torch.float32 else out_dtype
+    x = (qg.to(compute_dtype) - params.zero_point.to(compute_dtype)) * params.scale.to(compute_dtype)
     return x.reshape_as(q).to(out_dtype)
 
 
@@ -92,6 +100,7 @@ def affine_quantize_per_group_token_dim(
     group_size: int,
     *,
     eps: float = 1e-8,
+    diagnostics: bool = False,
 ) -> Tuple[torch.Tensor, AffineQuantParams]:
     """KIVI keys: group along the token axis (paper "per-channel" / stats across tokens).
 
@@ -107,7 +116,9 @@ def affine_quantize_per_group_token_dim(
     if x.shape[-2] % group_size != 0:
         raise ValueError(f"token dim {x.shape[-2]} not divisible by group_size {group_size}")
     x_t = x.transpose(-1, -2).contiguous()
-    q_t, params_t = affine_quantize_per_group_last_dim(x_t, bits=bits, group_size=group_size, eps=eps)
+    q_t, params_t = affine_quantize_per_group_last_dim(
+        x_t, bits=bits, group_size=group_size, eps=eps, diagnostics=diagnostics
+    )
     return q_t.transpose(-1, -2).contiguous(), params_t
 
 
@@ -117,10 +128,13 @@ def affine_dequantize_per_group_token_dim(
     group_size: int,
     *,
     out_dtype: torch.dtype,
+    diagnostics: bool = False,
 ) -> torch.Tensor:
     """Inverse of affine_quantize_per_group_token_dim (KIVI K path)."""
     q_t = q.transpose(-1, -2).contiguous()
-    x_t = affine_dequantize_per_group_last_dim(q_t, params, group_size, out_dtype=out_dtype)
+    x_t = affine_dequantize_per_group_last_dim(
+        q_t, params, group_size, out_dtype=out_dtype, diagnostics=diagnostics
+    )
     return x_t.transpose(-1, -2).contiguous()
 
 

@@ -157,11 +157,15 @@ class AttentionCacheAdapter(nn.Module):
             has_past = int(getattr(state, "total_len", 0)) > 0
             if has_past:
                 k_past, v_past = self.cache_impl.materialize(state, out_dtype=query_states.dtype)
-                k_all = torch.cat([k_past, key_states.to(query_states.dtype)], dim=-2)
-                v_all = torch.cat([v_past, value_states.to(query_states.dtype)], dim=-2)
+                k_new = key_states.to(query_states.dtype)
+                v_new = value_states.to(query_states.dtype)
+                k_all = torch.cat([k_past, k_new], dim=-2)
+                v_all = torch.cat([v_past, v_new], dim=-2)
             else:
-                k_all = key_states.to(query_states.dtype)
-                v_all = value_states.to(query_states.dtype)
+                k_new = key_states.to(query_states.dtype)
+                v_new = value_states.to(query_states.dtype)
+                k_all = k_new
+                v_all = v_new
             # Decode path keeps current behavior: write new KV before returning.
             state = self.cache_impl.append(state, key_states, value_states)
             self._kvbench_state = state
@@ -188,11 +192,20 @@ class AttentionCacheAdapter(nn.Module):
                     )
 
         # Repeat kv to match query heads.
-        k_all = repeat_kv(k_all, self.num_kv_groups)
-        v_all = repeat_kv(v_all, self.num_kv_groups)
-
-        # Attention logits and output.
-        attn_weights = torch.matmul(query_states, k_all.transpose(-2, -1)) / (self.head_dim**0.5)
+        if is_kivi_cache and q_len == 1 and has_past:
+            k_past = repeat_kv(k_past, self.num_kv_groups)
+            v_past = repeat_kv(v_past, self.num_kv_groups)
+            k_new = repeat_kv(k_new, self.num_kv_groups)
+            v_new = repeat_kv(v_new, self.num_kv_groups)
+            attn_past = torch.matmul(query_states, k_past.transpose(-2, -1))
+            attn_new = torch.matmul(query_states, k_new.transpose(-2, -1))
+            attn_weights = torch.cat([attn_past, attn_new], dim=-1) / (self.head_dim**0.5)
+            v_all = torch.cat([v_past, v_new], dim=-2)
+        else:
+            k_all = repeat_kv(k_all, self.num_kv_groups)
+            v_all = repeat_kv(v_all, self.num_kv_groups)
+            # Attention logits and output.
+            attn_weights = torch.matmul(query_states, k_all.transpose(-2, -1)) / (self.head_dim**0.5)
 
         # Use HF-provided causal mask only during prefill (q_len>1).
         # For incremental decoding (q_len==1), the adapter cache already contains only past tokens,
